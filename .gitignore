@@ -1,0 +1,32 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor/system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment secrets
+.env
+
+# Local temporary and runtime logs
+*.log
+
+# Excel temporary files
+~$*.xlsx
+
+# Playwright and test outputs
+playwright-report/
