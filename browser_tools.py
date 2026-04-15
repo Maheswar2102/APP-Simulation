@@ -3,7 +3,10 @@ Playwright browser tools exposed to the Claude agent via tool use.
 Each function maps 1:1 to a tool that Claude can call.
 """
 import base64
+import os
 from playwright.sync_api import Locator, Page
+
+from excel_config import load_named_table_rows_from_sheet
 
 
 def set_checkbox_state(locator: Locator, should_check: bool) -> bool:
@@ -425,6 +428,76 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "configure_all_hierarchies",
+            "description": (
+                "Configure all hierarchies in one call. For each hierarchy config, automatically clicks 'Add New' "
+                "in the hierarchy list frame, then fills the form (name, levels, checkboxes) and saves. "
+                "Use this instead of calling click+configure_hierarchy_form manually for each hierarchy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hierarchies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "hierarchy_name": {"type": "string"},
+                                "levels": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "visible": {"type": "boolean"},
+                                            "non_hierarchial": {"type": "boolean"}
+                                        },
+                                        "required": ["name"]
+                                    }
+                                }
+                            },
+                            "required": ["hierarchy_name", "levels"]
+                        },
+                        "description": "List of hierarchy configs to configure in sequence."
+                    },
+                    "frame_url_contains": {
+                        "type": "string",
+                        "description": "Optional preferred frame URL fragment (default: 'hierarchy.action')."
+                    }
+                },
+                "required": ["hierarchies"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "configure_attributes_by_hierarchy",
+            "description": (
+                "On Master data > Attributes list, open each hierarchy row using the edit/pencil action, "
+                "then add attributes from Excel rows and save each record. "
+                "If attributes_rows is omitted, the tool auto-loads rows from EXCEL_PATH."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attributes_rows": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Rows from Excel with headers such as Attribute Name, Hierarchy, Map To, Attribute Type, Editable.",
+                    },
+                    "frame_url_contains": {
+                        "type": "string",
+                        "description": "Preferred frame URL fragment for attributes pages (default: 'attribute').",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -564,7 +637,12 @@ class BrowserTools:
         if frame_name:
             return next((f for f in frames if f.name == frame_name), None)
         if frame_url_contains:
-            return next((f for f in frames if frame_url_contains in f.url), None)
+            # Prefer exact-case match first, then case-insensitive URL contains.
+            exact = next((f for f in frames if frame_url_contains in (f.url or "")), None)
+            if exact:
+                return exact
+            wanted = frame_url_contains.lower()
+            return next((f for f in frames if wanted in (f.url or "").lower()), None)
         return None
 
     def _tool_get_frames(self) -> str:
@@ -616,119 +694,125 @@ class BrowserTools:
         label: str = None,
         value: str = None,
     ) -> str:
+        if not label and not value:
+            return "ERROR: select_option_in_frame requires either 'label' or 'value'"
+
+        # Resolve frame with retry to handle post-login/config-manager load latency.
+        frame = None
+        for _ in range(10):
+            try:
+                frame = self._get_frame(frame_url_contains, frame_name, frame_index)
+                if frame is not None:
+                    break
+            except Exception:
+                pass
+            self.page.wait_for_timeout(500)
+
+        if frame is None:
+            return "ERROR: Could not find matching frame after retries. Use get_frames to list available frames."
+
+        # Wait for dropdown and at least one option to appear.
         try:
-            frame = self._get_frame(frame_url_contains, frame_name, frame_index)
-            if frame is None:
-                return "ERROR: Could not find matching frame. Use get_frames to list available frames."
+            frame.wait_for_selector(selector, timeout=12_000)
         except Exception as e:
-            return f"ERROR getting frame: {e}"
-        
-        try:
-            if label:
-                # First, wait for the dropdown to be ready and have options
-                try:
-                    frame.wait_for_selector(selector, timeout=5000)
-                except:
-                    pass  # Element might not exist yet, but we'll try anyway
-                
-                # Give the dropdown a moment to populate if it's dynamic
-                try:
-                    frame.evaluate("""(sel) => {
+            return f"ERROR: Selector '{selector}' not found in frame '{frame.url}': {str(e)[:140]}"
+
+        options_ready = False
+        for _ in range(12):
+            try:
+                count = frame.evaluate(
+                    """(sel) => {
                         const el = document.querySelector(sel);
-                        if (el && el.options.length === 0) {
-                            // Dropdown has no options yet, might need a moment
-                            return new Promise(resolve => setTimeout(resolve, 500));
-                        }
-                        return Promise.resolve();
-                    }""", selector)
-                except:
-                    pass
-                
-                try:
-                    frame.select_option(selector, label=label, timeout=10_000)
-                    return f"Selected option with label '{label}' in frame '{frame.url}' selector '{selector}'"
-                except Exception:
-                    # Fallback: advanced matching with multiple strategies
-                    matched_value, match_type = frame.evaluate(
-                        """([sel, wanted]) => {
-                            const el = document.querySelector(sel);
-                            if (!el) return [null, 'NO_ELEMENT'];
-                            
-                            const options = Array.from(el.options);
-                            if (options.length === 0) return [null, 'NO_OPTIONS'];
-                            
-                            // Normalize function for better matching
-                            const normalize = (str) => {
-                                return (str || '')
-                                    .trim()
-                                    .toLowerCase()
-                                    .replace(/\\s+/g, ' ')           // normalize internal whitespace
-                                    .replace(/\\u00A0/g, ' ')         // replace non-breaking spaces
-                                    .replace(/[^\\w\\s]/g, (c) => c === ' ' ? ' ' : '');  // remove special chars but keep spaces
-                            };
-                            
-                            const wantedNorm = normalize(wanted);
-                            
-                            // Strategy 1: Exact match after normalization
-                            let opt = options.find(o => normalize(o.text) === wantedNorm);
-                            if (opt) return [opt.value, 'EXACT'];
-                            
-                            // Strategy 2: Contains match (wanted is substring of option)
-                            opt = options.find(o => normalize(o.text).includes(wantedNorm));
-                            if (opt) return [opt.value, 'CONTAINS_SUBSTRING'];
-                            
-                            // Strategy 3: Reverse contains (option is substring of wanted)
-                            opt = options.find(o => wantedNorm.includes(normalize(o.text)));
-                            if (opt) return [opt.value, 'REVERSE_SUBSTRING'];
-                            
-                            // Strategy 4: Partial word match (all words in wanted present in option)
-                            const wantedWords = wantedNorm.split(' ').filter(w => w);
-                            opt = options.find(o => {
-                                const optNorm = normalize(o.text);
-                                return wantedWords.every(w => optNorm.includes(w));
-                            });
-                            if (opt) return [opt.value, 'PARTIAL_WORDS'];
-                            
-                            // Return first option text for debugging if no match
-                            const firstOptionText = options[0]?.text || '';
-                            return [null, `NO_MATCH (first option: "${firstOptionText}", wanted: "${wanted}")`, options.map(o => o.text)];
-                        }""",
-                        [selector, label],
-                    )
-                    
-                    if isinstance(matched_value, list):
-                        # Extended error response with option list
-                        available_options = matched_value[2] if len(matched_value) > 2 else []
-                        return (
-                            f"ERROR: No suitable option found for label '{label}' in selector '{selector}'. "
-                            f"Match attempt: {matched_value[1] if len(matched_value) > 1 else 'UNKNOWN'}. "
-                            f"Available options: {available_options}"
-                        )
-                    
-                    if matched_value is None:
-                        match_info = match_type if isinstance(match_type, str) else str(match_type)
-                        return (
-                            f"ERROR executing select_option_in_frame: No option matching label '{label}' "
-                            f"for selector '{selector}'. Reason: {match_info}"
-                        )
-                    
-                    try:
-                        frame.select_option(selector, value=str(matched_value), timeout=10_000)
-                        match_strategy = match_type if isinstance(match_type, str) else 'FALLBACK'
-                        return (
-                            f"Selected option for label '{label}' using strategy '{match_strategy}' "
-                            f"with matched value '{matched_value}' in frame '{frame.url}' selector '{selector}'"
-                        )
-                    except Exception as e:
-                        return f"ERROR: Could not select found value '{matched_value}': {str(e)[:150]}"
-            elif value:
+                        return el ? el.options.length : 0;
+                    }""",
+                    selector,
+                )
+                if isinstance(count, int) and count > 0:
+                    options_ready = True
+                    break
+            except Exception:
+                pass
+            self.page.wait_for_timeout(350)
+
+        if not options_ready:
+            return f"ERROR: Dropdown '{selector}' is present but has no options in frame '{frame.url}'"
+
+        if value:
+            try:
                 frame.select_option(selector, value=value, timeout=10_000)
                 return f"Selected option with value '{value}' in frame '{frame.url}' selector '{selector}'"
-            else:
-                return "ERROR: select_option_in_frame requires either 'label' or 'value'"
+            except Exception as e:
+                return f"ERROR selecting value '{value}' in '{selector}': {str(e)[:180]}"
+
+        # Label path: robust normalize + set value + dispatch change/input + verify selected text.
+        try:
+            result = frame.evaluate(
+                r"""([sel, wanted]) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return {ok: false, reason: 'NO_ELEMENT', options: []};
+
+                    const normalize = (s) => (s || '')
+                        .trim()
+                        .toLowerCase()
+                        .replace(/\u00a0/g, ' ')
+                        .replace(/\s+/g, ' ');
+
+                    const wantedNorm = normalize(wanted);
+                    const opts = Array.from(el.options || []);
+                    const optionTexts = opts.map(o => (o.text || '').trim());
+
+                    if (!opts.length) {
+                        return {ok: false, reason: 'NO_OPTIONS', options: optionTexts};
+                    }
+
+                    let target = opts.find(o => normalize(o.text) === wantedNorm)
+                        || opts.find(o => normalize(o.text).includes(wantedNorm))
+                        || opts.find(o => wantedNorm.includes(normalize(o.text)));
+
+                    if (!target) {
+                        const words = wantedNorm.split(' ').filter(Boolean);
+                        target = opts.find(o => {
+                            const txt = normalize(o.text);
+                            return words.every(w => txt.includes(w));
+                        });
+                    }
+
+                    if (!target) {
+                        return {ok: false, reason: 'NO_MATCH', options: optionTexts};
+                    }
+
+                    el.value = target.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    const selectedText = (el.options[el.selectedIndex]?.text || '').trim();
+                    const verified = normalize(selectedText) === normalize(target.text)
+                        || normalize(selectedText).includes(normalize(target.text));
+
+                    return {
+                        ok: verified,
+                        reason: verified ? 'OK' : 'VERIFY_FAILED',
+                        selectedText,
+                        selectedValue: el.value,
+                        matchedText: (target.text || '').trim(),
+                        options: optionTexts,
+                    };
+                }""",
+                [selector, label],
+            )
         except Exception as e:
-            # Catch frame closed or other runtime errors
-            return f"ERROR in select_option_in_frame: {str(e)[:200]}"
+            return f"ERROR in select_option_in_frame evaluate path: {str(e)[:180]}"
+
+        if result.get("ok"):
+            return (
+                f"Selected option with label '{label}' in frame '{frame.url}' selector '{selector}' "
+                f"(matched='{result.get('matchedText', '')}', value='{result.get('selectedValue', '')}')"
+            )
+
+        return (
+            f"ERROR executing select_option_in_frame: Could not select label '{label}' in selector '{selector}'. "
+            f"Reason: {result.get('reason', 'UNKNOWN')}. Available options: {result.get('options', [])}"
+        )
 
     def _tool_get_page_content_in_frame(
         self,
@@ -1515,3 +1599,506 @@ class BrowserTools:
             result_msg += f" [WARNING: {len(checkbox_issues_overall)} level(s) had checkbox matching issues]"
         
         return result_msg
+
+    def _tool_configure_all_hierarchies(
+        self,
+        hierarchies: list,
+        frame_url_contains: str = "hierarchy.action",
+    ) -> str:
+        """Configure multiple hierarchies sequentially.
+
+        For each hierarchy: re-acquires the frame fresh, clicks Add New, fills form, saves.
+        Re-acquiring the frame each time handles the frame reload that happens after each Save.
+        """
+        if not isinstance(hierarchies, list) or not hierarchies:
+            return "ERROR: hierarchies must be a non-empty list"
+
+        def _fresh_hierarchy_frame():
+            """Always return a live (non-detached) frame matching frame_url_contains."""
+            for f in self.page.frames:
+                try:
+                    furl = (f.url or "").lower()
+                    if frame_url_contains.lower() in furl or "hierarchy" in furl:
+                        # Probe that the frame is alive
+                        _ = f.evaluate("() => document.readyState")
+                        # Prefer frames that actually contain hierarchy list/form content.
+                        has_hierarchy_ui = f.evaluate(
+                            """() => {
+                                const txt = (document.body?.innerText || '').toLowerCase();
+                                return txt.includes('hierarchy') ||
+                                       !!document.querySelector("input[name='hierarchyForm:name'], input[id='hierarchyForm:name']");
+                            }"""
+                        )
+                        if not has_hierarchy_ui:
+                            continue
+                        return f
+                except Exception:
+                    continue
+            return None
+
+        def _click_add_new() -> bool:
+            """Click 'Add New' in the hierarchy frame, or any visible frame."""
+            # Try dedicated hierarchy frame first
+            hf = _fresh_hierarchy_frame()
+            if hf:
+                try:
+                    ok = hf.evaluate(
+                        r"""() => {
+                            const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
+                            const btn = [...document.querySelectorAll('a,button,input[type=submit],input[type=button]')]
+                                .find(el => norm(el.innerText||el.value||'') === 'add new'
+                                         || norm(el.innerText||el.value||'').includes('add new'));
+                            if (btn) { btn.click(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if ok:
+                        return True
+                except Exception:
+                    pass
+
+            # Fallback: scan only hierarchy-like live frames (avoid ShowConfigurations misclicks)
+            for f in self.page.frames:
+                try:
+                    furl = (f.url or "").lower()
+                    if "hierarchy" not in furl:
+                        txt = f.evaluate("() => (document.body?.innerText || '').toLowerCase().slice(0, 5000)")
+                        if "hierarchy" not in txt:
+                            continue
+                    ok = f.evaluate(
+                        r"""() => {
+                            const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
+                            const btn = [...document.querySelectorAll('a,button,input[type=submit],input[type=button]')]
+                                .find(el => {
+                                    const t = norm(el.innerText||el.value||'');
+                                    return t === 'add new' || t.includes('add new');
+                                });
+                            if (btn) { btn.click(); return true; }
+                            return false;
+                        }"""
+                    )
+                    if ok:
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        results = []
+        for cfg in hierarchies:
+            if not isinstance(cfg, dict):
+                results.append({"hierarchy": str(cfg), "status": "ERROR", "reason": "Config item is not a dict"})
+                continue
+            name = cfg.get("hierarchy_name") or cfg.get("name", "")
+            levels = cfg.get("levels", [])
+            if not name:
+                results.append({"hierarchy": "(unknown)", "status": "ERROR", "reason": "Missing hierarchy_name"})
+                continue
+
+            # Wait a beat for any previous save to settle, then click Add New
+            self.page.wait_for_timeout(800)
+            add_clicked = _click_add_new()
+            if not add_clicked:
+                results.append({"hierarchy": name, "status": "ERROR", "reason": "Could not click 'Add New' button"})
+                continue
+
+            self.page.wait_for_timeout(1200)
+
+            # Fill and save the hierarchy form
+            form_result = "ERROR: hierarchy form not attempted"
+            for attempt in range(1, 3):
+                try:
+                    form_result = self._tool_configure_hierarchy_form(name, levels, frame_url_contains)
+                except Exception as e:
+                    form_result = f"ERROR: {e}"
+
+                # If the dialog did not appear yet, click Add New again and retry once.
+                if "Could not locate hierarchy form frame" in form_result and attempt == 1:
+                    self.page.wait_for_timeout(700)
+                    _click_add_new()
+                    self.page.wait_for_timeout(1200)
+                    continue
+                break
+
+            if "ERROR" in form_result:
+                results.append({"hierarchy": name, "status": "ERROR", "reason": form_result[:200]})
+            else:
+                results.append({"hierarchy": name, "status": "OK", "detail": form_result[:150]})
+
+        return f"configure_all_hierarchies results: {results}"
+
+    def _tool_configure_attributes_by_hierarchy(
+        self,
+        attributes_rows: list | None = None,
+        frame_url_contains: str = "attribute",
+    ) -> str:
+        """Configure Attributes by opening each hierarchy row (pencil/edit), then adding attribute rows.
+
+        The Attributes list page and editor both live in the same hierarchyAttribute.action frame.
+        After clicking the pencil icon the frame content switches to the editor form.
+        Fields: Attribute Name (text input), Map To (1st select), Attribute Type (2nd select),
+        Editable (checkbox).  Each row is committed with the 'Add' submit button.
+        All rows for one hierarchy are committed with the 'Save' submit button.
+        """
+        if not isinstance(attributes_rows, list) or not attributes_rows:
+            excel_path = os.environ.get("EXCEL_PATH", "").strip() or "Test Documentxl.xlsx"
+            master_data_sheet = os.environ.get("EXCEL_MENU_SHEET", "Master data").strip() or "Master data"
+            target_sheet = os.environ.get("EXCEL_TARGET_SHEET", "Attributes").strip() or "Attributes"
+
+            try:
+                rows_master = load_named_table_rows_from_sheet(excel_path, master_data_sheet, "Attribute Name")
+                rows_target = load_named_table_rows_from_sheet(excel_path, target_sheet, "Attribute Name")
+                attributes_rows = rows_master or rows_target
+            except Exception as e:
+                return f"ERROR: attributes_rows missing and auto-load failed: {e}"
+
+            if not isinstance(attributes_rows, list) or not attributes_rows:
+                return (
+                    "ERROR: attributes_rows missing and auto-load found no attribute rows "
+                    f"(excel='{excel_path}', sheets tried: '{master_data_sheet}', '{target_sheet}')."
+                )
+
+        def _norm(s: str) -> str:
+            return (s or "").strip().lower().replace(" ", "")
+
+        def _get_row_val(row: dict, aliases: list) -> str:
+            if not isinstance(row, dict):
+                return ""
+            for k, v in row.items():
+                nk = _norm(str(k))
+                if nk in aliases:
+                    return "" if v is None else str(v).strip()
+            return ""
+
+        def _find_list_frame():
+            # Prefer the dedicated hierarchyAttribute frame; fall back to any URL with 'attribute'.
+            for f in self.page.frames:
+                if "hierarchyAttribute" in (f.url or ""):
+                    return f
+            preferred = [
+                f for f in self.page.frames
+                if frame_url_contains.lower() in (f.url or "").lower()
+            ]
+            # Pick the one that actually shows the hierarchy-list table.
+            for f in (preferred or self.page.frames):
+                try:
+                    has_list = f.evaluate(
+                        """() => {
+                            const txt = (document.body?.innerText || '').toLowerCase();
+                            return txt.includes('hierarchy name') && txt.includes('actions');
+                        }"""
+                    )
+                    if has_list:
+                        return f
+                except Exception:
+                    continue
+            return preferred[0] if preferred else None
+
+        def _wait_for_attributes_list(max_tries: int = 20, delay_ms: int = 400):
+            """Wait for Attributes list frame/table to become available after menu navigation."""
+            last_frame = None
+            for _ in range(max_tries):
+                lf = _find_list_frame()
+                if lf is not None:
+                    last_frame = lf
+                    try:
+                        ready = lf.evaluate(
+                            """() => {
+                                const txt = (document.body?.innerText || '').toLowerCase();
+                                const hasListText = txt.includes('hierarchy name') && txt.includes('actions');
+                                const hasRows = document.querySelectorAll('tr').length > 1;
+                                const hasEditActions = !!document.querySelector(
+                                    "a[id*='hierarchyAttributeTable'], a[title*='edit' i], img[src*='edit' i], img[alt*='edit' i]"
+                                );
+                                return (hasListText && hasRows) || hasEditActions;
+                            }"""
+                        )
+                        if ready:
+                            return lf
+                    except Exception:
+                        pass
+                self.page.wait_for_timeout(delay_ms)
+            return last_frame
+
+        def _open_hierarchy_editor(list_frame, hierarchy_name: str) -> bool:
+            """Click the edit/pencil link for *hierarchy_name* in the list frame."""
+            try:
+                clicked = list_frame.evaluate(
+                    r"""(targetName) => {
+                        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const wanted = norm(targetName);
+                        const rows = Array.from(document.querySelectorAll('tr'));
+
+                        const getRowHierarchyText = (row) => {
+                            const tds = Array.from(row.querySelectorAll('td'));
+                            if (!tds.length) return '';
+                            // Prefer non-action cells for hierarchy name matching.
+                            for (const td of tds) {
+                                const txt = norm(td.innerText || td.textContent || '');
+                                const hasAction = !!td.querySelector('a, button, img, input[type="image"]');
+                                if (txt && !hasAction) return txt;
+                            }
+                            return norm(tds[0].innerText || tds[0].textContent || '');
+                        };
+
+                        const clickRowEdit = (row) => {
+                            let btn = row.querySelector(
+                                "a[id*='hierarchyAttributeTable'] img, " +
+                                "a[id*='hierarchyAttributeTable'], " +
+                                "a[title*='edit' i], a[aria-label*='edit' i], " +
+                                "img[src*='edit' i], img[alt*='Edit' i], img[title*='edit' i], " +
+                                "img[src*='pencil' i]"
+                            );
+                            if (!btn) {
+                                // Prefer action column link/button if present
+                                const tds = Array.from(row.querySelectorAll('td'));
+                                const lastTd = tds.length ? tds[tds.length - 1] : null;
+                                if (lastTd) {
+                                    btn = lastTd.querySelector("a, button, img");
+                                }
+                            }
+                            if (!btn) btn = row.querySelector("a img, a, button");
+                            if (!btn) return false;
+                            const clickable = btn.closest('a, button') || btn;
+                            clickable.click();
+                            return true;
+                        };
+
+                        // Pass 1: exact hierarchy name match.
+                        for (const row of rows) {
+                            const hText = getRowHierarchyText(row);
+                            if (!hText) continue;
+                            if (hText === wanted && clickRowEdit(row)) return true;
+                        }
+
+                        // Pass 2: fallback to contains match.
+                        for (const row of rows) {
+                            const hText = getRowHierarchyText(row);
+                            if (!hText) continue;
+                            if ((hText.includes(wanted) || wanted.includes(hText)) && clickRowEdit(row)) return true;
+                        }
+
+                        return false;
+                    }""",
+                    hierarchy_name,
+                )
+                return bool(clicked)
+            except Exception:
+                return False
+
+        def _fill_attr_row(editor_frame, attr_name: str, map_to: str, attr_type: str, editable: str) -> tuple[bool, str]:
+            """Fill the attribute form fields in the editor and click Add."""
+            # 1) Attribute Name — use JS to set value + fire ICEfaces events
+            try:
+                ok = editor_frame.evaluate(
+                    r"""([val]) => {
+                        const inp = document.querySelector('input[name$="attributeName"], input[id$="attributeName"]');
+                        if (!inp) return false;
+                        inp.focus();
+                        inp.value = val;
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.blur();
+                        return true;
+                    }""",
+                    [attr_name],
+                )
+                if not ok:
+                    return False, "Attribute Name input not found"
+            except Exception as e:
+                return False, f"Attribute Name fill error: {e}"
+
+            # 2) Map To — first <select> in the form
+            if map_to and map_to.lower() not in ("", "select"):
+                try:
+                    editor_frame.evaluate(
+                        r"""([val]) => {
+                            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                            const wanted = norm(val);
+                            const selects = document.querySelectorAll('select');
+                            for (const sel of selects) {
+                                const opt = Array.from(sel.options).find(o => norm(o.text) === wanted)
+                                          || Array.from(sel.options).find(o => norm(o.text).includes(wanted));
+                                if (opt) {
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        [map_to],
+                    )
+                except Exception:
+                    pass  # Map To is optional
+
+            # 3) Attribute Type — select whose options include Integer/String/Date/Numeric
+            if attr_type:
+                try:
+                    ok = editor_frame.evaluate(
+                        r"""([val]) => {
+                            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                            const wanted = norm(val);
+                            const typeOptions = ['integer', 'string', 'date', 'numeric'];
+                            const selects = document.querySelectorAll('select');
+                            for (const sel of selects) {
+                                const opts = Array.from(sel.options).map(o => norm(o.text));
+                                if (!opts.some(t => typeOptions.includes(t))) continue;
+                                const opt = Array.from(sel.options).find(o => norm(o.text) === wanted)
+                                          || Array.from(sel.options).find(o => norm(o.text).includes(wanted));
+                                if (!opt) continue;
+                                sel.value = opt.value;
+                                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                return true;
+                            }
+                            return false;
+                        }""",
+                        [attr_type],
+                    )
+                    if not ok:
+                        return False, f"Attribute Type '{attr_type}' not set (option not found)"
+                except Exception as e:
+                    return False, f"Attribute Type set error: {e}"
+
+            # 4) Editable checkbox
+            should_check = _norm(editable) in ("true", "yes", "1")
+            try:
+                cb_loc = editor_frame.locator('input[type="checkbox"]')
+                if cb_loc.count() > 0:
+                    set_checkbox_state(cb_loc.first, should_check)
+            except Exception:
+                pass  # Editable is optional
+
+            # 5) Click the 'Add' submit button (ICEfaces uses iceSubmit; JS click is most reliable)
+            try:
+                clicked = editor_frame.evaluate(
+                    r"""() => {
+                        const btn = document.querySelector('input[type="submit"][value="Add"]')
+                                 || document.querySelector('input[type="submit"]');
+                        if (!btn) return false;
+                        // Trigger via onclick if present (ICEfaces iceSubmit pattern)
+                        const oc = btn.getAttribute('onclick');
+                        if (oc) {
+                            try {
+                                const form = btn.form || btn.closest('form');
+                                const evt = new MouseEvent('click', {bubbles: true, cancelable: true});
+                                btn.dispatchEvent(evt);
+                                return true;
+                            } catch (e) {}
+                        }
+                        btn.click();
+                        return true;
+                    }"""
+                )
+                if not clicked:
+                    return False, "Add button not found in editor"
+            except Exception as e:
+                return False, f"Add button click error: {e}"
+
+            # ICEfaces AJAX needs time to process the row and reset the form
+            self.page.wait_for_timeout(1200)
+            return True, "ok"
+
+        # ---------------------------------------------------------------
+        # Normalize and group rows by hierarchy
+        # ---------------------------------------------------------------
+        grouped: dict = {}
+        current_hierarchy = ""
+        skipped_missing_hierarchy = []
+        for idx, row in enumerate(attributes_rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            attr_name = _get_row_val(row, ["attributename", "name"])
+            hierarchy = _get_row_val(row, ["hierarchy", "hierarchyname"])
+            if hierarchy:
+                current_hierarchy = hierarchy
+            effective_hierarchy = current_hierarchy.strip()
+
+            if not attr_name:
+                continue
+            if not effective_hierarchy:
+                skipped_missing_hierarchy.append({"row": idx, "attribute": attr_name})
+                continue
+
+            grouped.setdefault(effective_hierarchy, []).append(row)
+
+        if not grouped:
+            return "ERROR: No valid attribute rows found (need Attribute Name + Hierarchy)."
+
+        list_frame = _wait_for_attributes_list()
+        if list_frame is None:
+            return "ERROR: Could not find Attributes list frame (Hierarchy Name/Actions table)."
+
+        results = []
+        for hierarchy_name, rows in grouped.items():
+            # Open the editor for this hierarchy (pencil click)
+            opened = _open_hierarchy_editor(list_frame, hierarchy_name)
+            if not opened:
+                results.append({
+                    "hierarchy": hierarchy_name,
+                    "status": "ERROR",
+                    "reason": f"Could not find/click pencil icon for '{hierarchy_name}' in list",
+                })
+                continue
+
+            # The same frame now shows the editor (content changed in place)
+            self.page.wait_for_timeout(1_500)
+            editor_frame = list_frame
+
+            # Verify editor loaded
+            editor_ready = False
+            try:
+                editor_ready = editor_frame.evaluate(
+                    """() => !!document.querySelector('input[name$="attributeName"], input[id$="attributeName"]')"""
+                )
+            except Exception:
+                pass
+            if not editor_ready:
+                results.append({
+                    "hierarchy": hierarchy_name,
+                    "status": "ERROR",
+                    "reason": "Editor form did not load after pencil click (Attribute Name input not found)",
+                })
+                continue
+
+            row_success = 0
+            row_errors = []
+            for row in rows:
+                attr_name = _get_row_val(row, ["attributename", "name"])
+                map_to = _get_row_val(row, ["mapto", "map", "mapsto"])
+                attr_type = _get_row_val(row, ["attributetype", "type", "datatype"])
+                editable = _get_row_val(row, ["editable", "iseditable"])
+
+                ok, msg = _fill_attr_row(editor_frame, attr_name, map_to, attr_type, editable)
+                if ok:
+                    row_success += 1
+                else:
+                    row_errors.append(f"{attr_name}: {msg}")
+
+            # Click Save to persist all added attributes
+            try:
+                save_loc = editor_frame.locator('input[type="submit"][value="Save"]')
+                if save_loc.count() > 0:
+                    save_loc.click(timeout=3_000)
+                    self.page.wait_for_timeout(1_000)
+            except Exception as e:
+                row_errors.append(f"Save button error: {e}")
+
+            status = "OK" if not row_errors else ("PARTIAL" if row_success > 0 else "ERROR")
+            results.append({
+                "hierarchy": hierarchy_name,
+                "status": status,
+                "configured": row_success,
+                "total": len(rows),
+                "errors": row_errors[:5],
+            })
+
+            # After Save the frame should return to the list view
+            self.page.wait_for_timeout(500)
+            list_frame = _find_list_frame() or list_frame
+
+        if skipped_missing_hierarchy:
+            return (
+                f"Configured attributes by hierarchy: {results}; "
+                f"Skipped rows with missing hierarchy before first hierarchy value: {skipped_missing_hierarchy[:5]}"
+            )
+        return f"Configured attributes by hierarchy: {results}"

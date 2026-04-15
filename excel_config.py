@@ -104,6 +104,75 @@ def load_sheet_rows_as_dicts(file_path: str, sheet_name: str) -> list[dict[str, 
     return rows
 
 
+def load_named_table_rows_from_sheet(
+    file_path: str,
+    sheet_name: str,
+    header_first_col: str,
+) -> list[dict[str, str]]:
+    """
+    Read a table whose header row can appear anywhere in the sheet.
+
+    The header row is identified by the first-column header text (case-insensitive),
+    then subsequent non-empty rows are returned as dictionaries until a fully blank row.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        raise ValueError(f"Only Excel files are supported (.xlsx/.xlsm). Got: {path.name}")
+
+    wb = load_workbook(path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+
+    header_row_idx: int | None = None
+    target = header_first_col.strip().lower()
+    for r in range(1, ws.max_row + 1):
+        first_val = ws.cell(row=r, column=1).value
+        first_text = "" if first_val is None else str(first_val).strip().lower()
+        if first_text == target:
+            header_row_idx = r
+            break
+
+    if header_row_idx is None:
+        return []
+
+    headers: list[str] = []
+    for c in range(1, ws.max_column + 1):
+        raw = ws.cell(row=header_row_idx, column=c).value
+        h = str(raw or "").strip()
+        headers.append(h)
+
+    # Use only non-empty headers and preserve order.
+    active_cols: list[tuple[int, str]] = []
+    for idx, h in enumerate(headers, start=1):
+        if h:
+            active_cols.append((idx, h))
+
+    if not active_cols:
+        return []
+
+    rows: list[dict[str, str]] = []
+    for r in range(header_row_idx + 1, ws.max_row + 1):
+        row_dict: dict[str, str] = {}
+        has_any = False
+        for c, key in active_cols:
+            val = ws.cell(row=r, column=c).value
+            text = "" if val is None else str(val).strip()
+            if text:
+                has_any = True
+            row_dict[key] = text
+
+        if not has_any:
+            break
+        rows.append(row_dict)
+
+    return rows
+
+
 def load_hierarchy_configs_from_master_data(file_path: str, sheet_name: str = "Master data") -> list[HierarchyColumnConfig]:
     """
     Parse hierarchy config from the Master data sheet in row-wise block format.

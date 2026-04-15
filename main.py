@@ -11,6 +11,7 @@ from agent import WebAgent
 from excel_config import (
     load_hierarchy_configs_from_master_data,
     load_menu_target_from_sheet,
+    load_named_table_rows_from_sheet,
     load_runtime_config_from_excel,
     load_sheet_rows_as_dicts,
 )
@@ -27,6 +28,7 @@ EXCEL_ROW_INDEX = int(os.environ.get("EXCEL_ROW_INDEX", "1"))
 EXCEL_CREDENTIALS_SHEET = os.environ.get("EXCEL_CREDENTIALS_SHEET", "Credentials")
 EXCEL_MENU_SHEET = os.environ.get("EXCEL_MENU_SHEET", "")
 EXCEL_HIERARCHY_SHEET = os.environ.get("EXCEL_HIERARCHY_SHEET", "Hierarchy")
+EXCEL_TARGET_SHEET = os.environ.get("EXCEL_TARGET_SHEET", "").strip()
 KEEP_OPEN = os.environ.get("KEEP_OPEN", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 if not GITHUB_TOKEN.strip():
@@ -40,16 +42,49 @@ runtime = load_runtime_config_from_excel(
     row_index=EXCEL_ROW_INDEX,
 )
 
-# Optional: drive left navigation from a dedicated sheet name (e.g. Master data)
+# Optional: drive left navigation from dedicated sheet names.
+# EXCEL_MENU_SHEET -> parent menu group (e.g. Master data)
+# EXCEL_TARGET_SHEET -> child menu item and workflow selector (e.g. Hierarchy, Attributes)
 if EXCEL_MENU_SHEET.strip():
     runtime.menu_group = EXCEL_MENU_SHEET
+
+if EXCEL_TARGET_SHEET:
+    runtime.menu_item = EXCEL_TARGET_SHEET
+elif EXCEL_MENU_SHEET.strip():
     runtime.menu_item = load_menu_target_from_sheet(EXCEL_PATH, EXCEL_MENU_SHEET)
 
-hierarchy_rows = load_sheet_rows_as_dicts(EXCEL_PATH, EXCEL_HIERARCHY_SHEET)
-master_data_hierarchy_configs = load_hierarchy_configs_from_master_data(EXCEL_PATH, EXCEL_MENU_SHEET or "Master data")
+target_sheet_name = EXCEL_TARGET_SHEET or EXCEL_HIERARCHY_SHEET
+target_sheet_key = target_sheet_name.strip().lower()
+
+target_rows = load_sheet_rows_as_dicts(EXCEL_PATH, target_sheet_name)
+attributes_rows_master_data = load_named_table_rows_from_sheet(
+    EXCEL_PATH,
+    EXCEL_MENU_SHEET or "Master data",
+    "Attribute Name",
+)
+attributes_rows_target_sheet = load_named_table_rows_from_sheet(
+    EXCEL_PATH,
+    EXCEL_TARGET_SHEET or "Attributes",
+    "Attribute Name",
+)
+
+attributes_rows = attributes_rows_master_data or attributes_rows_target_sheet
+
+master_data_hierarchy_configs = []
+if target_sheet_key in {"hierarchy", "hierarchies"}:
+    master_data_hierarchy_configs = load_hierarchy_configs_from_master_data(EXCEL_PATH, EXCEL_MENU_SHEET or "Master data")
+elif runtime.menu_group and runtime.menu_group.lower() == "master data" and attributes_rows_master_data:
+    # When Attributes are embedded in Master data, still load hierarchy blocks first.
+    master_data_hierarchy_configs = load_hierarchy_configs_from_master_data(EXCEL_PATH, EXCEL_MENU_SHEET or "Master data")
 
 has_customer_config = bool(runtime.customer_name and runtime.configuration_number)
 has_menu_target = bool(runtime.menu_group and runtime.menu_item)
+is_master_data_sequential = bool(
+    runtime.menu_group
+    and runtime.menu_group.lower() == "master data"
+    and master_data_hierarchy_configs
+    and attributes_rows
+)
 
 if not has_customer_config and not has_menu_target:
     raise ValueError(
@@ -78,13 +113,18 @@ After successful login (customer/config flow):
    - frame_url_contains="ShowConfigurations"
    - selector="#customerDD"
    - label="{runtime.customer_name}"
-   The tool handles whitespace and case automatically. If it fails, then call get_select_options_in_frame to diagnose. Do NOT attempt to click the dropdown first.
+    The tool handles whitespace and case automatically.
+    If it fails, recover in this exact order:
+    a. call get_frames
+    b. retry select_option_in_frame with the same parameters
+    c. if still failing, call get_select_options_in_frame for diagnostics and retry once more
+    Do NOT attempt to click the dropdown first.
 6. Open configuration "{runtime.configuration_number}" with open_configuration_read_only_in_frame using frame_url_contains="ShowConfigurations".
     - IMPORTANT: this must open the editable configuration, not view-only mode.
 7. Call get_frames ONCE to confirm editable config is open.
 """
 
-if has_menu_target:
+if has_menu_target and not is_master_data_sequential:
     TASK += f"""
 
 After that (menu navigation flow):
@@ -94,7 +134,7 @@ After that (menu navigation flow):
 10. Confirm the final screen opened for "{runtime.menu_item}".
 """
 
-if runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and runtime.menu_item.lower() == "hierarchy":
+if runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and target_sheet_key in {"hierarchy", "hierarchies"}:
     if master_data_hierarchy_configs:
         TASK += f"""
 
@@ -140,12 +180,12 @@ Rules for all hierarchies:
 - Each hierarchy MUST complete successfully before moving to the next one.
 - If a hierarchy fails after multiple retries, report detailed error and STOP.
 """
-    elif hierarchy_rows:
+    elif target_rows:
         TASK += f"""
 
-Hierarchy configuration flow (fallback from sheet '{EXCEL_HIERARCHY_SHEET}'):
+Hierarchy configuration flow (fallback from sheet '{target_sheet_name}'):
 11. Configure Hierarchy screen using EXACT values from these rows:
-{json.dumps(hierarchy_rows, indent=2)}
+{json.dumps(target_rows, indent=2)}
 
 Rules:
 - Do NOT invent values.
@@ -158,8 +198,52 @@ Rules:
         TASK += f"""
 
 Hierarchy configuration flow:
-11. No hierarchy rows found in '{EXCEL_MENU_SHEET or "Master data"}' and none in '{EXCEL_HIERARCHY_SHEET}'.
+11. No hierarchy rows found in '{EXCEL_MENU_SHEET or "Master data"}' and none in '{target_sheet_name}'.
     Report this clearly and stop without making hierarchy changes.
+"""
+elif runtime.menu_group and runtime.menu_group.lower() == "master data" and master_data_hierarchy_configs and attributes_rows:
+    TASK += f"""
+
+=== MASTER DATA SEQUENTIAL AUTOMATION ===
+Detected both hierarchy blocks and attributes rows in Excel.
+Run in this EXACT order:
+
+11. Open left menu using open_left_menu_item with:
+   - menu_group="{runtime.menu_group}"
+   - menu_item="Hierarchy"
+12. Call configure_all_hierarchies with exactly this parameter (do NOT call click_element_with_text separately):
+    hierarchies = {json.dumps([{
+    "hierarchy_name": cfg.hierarchy_name,
+    "levels": [{"name": lvl.name, "visible": lvl.visible, "non_hierarchial": lvl.non_hierarchial} for lvl in cfg.levels]
+} for cfg in master_data_hierarchy_configs])}
+    The tool handles 'Add New' + form fill + save for each hierarchy automatically.
+13. After configure_all_hierarchies succeeds, open left menu using open_left_menu_item with:
+   - menu_group="{runtime.menu_group}"
+   - menu_item="Attributes"
+14. Call configure_attributes_by_hierarchy with exactly this parameter:
+    attributes_rows = {json.dumps(attributes_rows)}
+    frame_url_contains = "attribute"
+    The tool handles opening each hierarchy editor, filling all attribute fields, and saving.
+15. Report results and done.
+"""
+elif runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and target_sheet_key in {"attribute", "attributes"}:
+    if attributes_rows or target_rows:
+        rows_for_attributes = attributes_rows or target_rows
+        TASK += f"""
+
+Attributes configuration flow (from sheet '{target_sheet_name}'):
+11. Call configure_attributes_by_hierarchy exactly as below (pass the full list inline as attributes_rows):
+    attributes_rows = {json.dumps(rows_for_attributes)}
+    frame_url_contains = "attribute"
+    The tool handles opening each hierarchy editor, filling all attribute fields, and saving.
+12. Report per-hierarchy success/failure and final screen state.
+"""
+    else:
+        TASK += f"""
+
+Attributes configuration flow:
+11. No attribute rows found in '{target_sheet_name}' or '{EXCEL_MENU_SHEET or "Master data"}'.
+    Report this clearly and stop without making attribute changes.
 """
 
 TASK += """
