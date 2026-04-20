@@ -58,11 +58,29 @@ class WebAgent:
     def run(self, task: str) -> str:
         """Start the browser and complete a task. Returns a summary."""
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=self.headless)
-            context = browser.new_context(
-                ignore_https_errors=True,  # dev/staging cert may be self-signed
-                viewport={"width": 1280, "height": 900},
-            )
+            launch_args: list[str] = []
+            context_kwargs: dict[str, Any] = {
+                "ignore_https_errors": True,  # dev/staging cert may be self-signed
+            }
+
+            zoom_raw = os.environ.get("KEEP_OPEN_ZOOM", "1.25").strip()
+            try:
+                keep_open_zoom = float(zoom_raw)
+            except ValueError:
+                keep_open_zoom = 1.25
+
+            # For interactive keep-open sessions, launch a maximized browser window.
+            if self.keep_open and not self.headless:
+                launch_args.append("--start-maximized")
+                if keep_open_zoom > 0 and keep_open_zoom != 1.0:
+                    launch_args.append(f"--force-device-scale-factor={keep_open_zoom}")
+                context_kwargs["viewport"] = None
+                print(f"[Browser] Launching in maximized window mode (zoom={keep_open_zoom:.2f}x).")
+            else:
+                context_kwargs["viewport"] = {"width": 1280, "height": 900}
+
+            browser = pw.chromium.launch(headless=self.headless, args=launch_args)
+            context = browser.new_context(**context_kwargs)
             page = context.new_page()
             tools = BrowserTools(page)
 

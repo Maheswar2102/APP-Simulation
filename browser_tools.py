@@ -6,7 +6,7 @@ import base64
 import os
 from playwright.sync_api import Locator, Page
 
-from excel_config import load_named_table_rows_from_sheet
+from excel_config import load_named_table_rows_from_sheet, load_cross_hierarchy_configs_from_master_data
 
 
 def set_checkbox_state(locator: Locator, should_check: bool) -> bool:
@@ -492,6 +492,32 @@ TOOL_DEFINITIONS = [
                     "frame_url_contains": {
                         "type": "string",
                         "description": "Preferred frame URL fragment for attributes pages (default: 'attribute').",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "configure_cross_hierarchies",
+            "description": (
+                "Configure Cross Hierarchy mappings on Master data > Cross Hierarchy page. "
+                "Opens the editor for each hierarchy pair (Product/Channel/Location) and sets their mappings. "
+                "If cross_hierarchy_rows is omitted, the tool auto-loads rows from EXCEL_PATH."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cross_hierarchy_rows": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Rows from Excel with headers such as Attribute Name, Hierarchy mappings.",
+                    },
+                    "frame_url_contains": {
+                        "type": "string",
+                        "description": "Preferred frame URL fragment for cross hierarchy pages (default: 'cross' or 'hierarchy').",
                     },
                 },
                 "required": [],
@@ -1636,8 +1662,37 @@ class BrowserTools:
                     continue
             return None
 
+        def _wait_for_hierarchy_list(max_tries: int = 20, delay_ms: int = 400):
+            """Wait until hierarchy list screen is present and Add New is available."""
+            last_frame = None
+            for _ in range(max_tries):
+                hf = _fresh_hierarchy_frame()
+                if hf is not None:
+                    last_frame = hf
+                    try:
+                        ready = hf.evaluate(
+                            r"""() => {
+                                const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
+                                const txt = (document.body?.innerText || '').toLowerCase();
+                                const hasList = txt.includes('hierarchy') && txt.includes('actions');
+                                const hasAddNew = [...document.querySelectorAll('a,button,input[type=submit],input[type=button]')]
+                                    .some(el => {
+                                        const t = norm(el.innerText||el.value||'');
+                                        return t === 'add new' || t.includes('add new');
+                                    });
+                                return hasAddNew || hasList;
+                            }"""
+                        )
+                        if ready:
+                            return hf
+                    except Exception:
+                        pass
+                self.page.wait_for_timeout(delay_ms)
+            return last_frame
+
         def _click_add_new() -> bool:
             """Click 'Add New' in the hierarchy frame, or any visible frame."""
+            _wait_for_hierarchy_list()
             # Try dedicated hierarchy frame first
             hf = _fresh_hierarchy_frame()
             if hf:
@@ -1695,10 +1750,30 @@ class BrowserTools:
                 continue
 
             # Wait a beat for any previous save to settle, then click Add New
+            _wait_for_hierarchy_list()
             self.page.wait_for_timeout(800)
-            add_clicked = _click_add_new()
+            add_clicked = False
+            for _ in range(5):
+                add_clicked = _click_add_new()
+                if add_clicked:
+                    break
+                self.page.wait_for_timeout(500)
             if not add_clicked:
-                results.append({"hierarchy": name, "status": "ERROR", "reason": "Could not click 'Add New' button"})
+                # Recovery: if agent navigated away, force back to Master data > Hierarchy and retry.
+                try:
+                    self._tool_open_left_menu_item(menu_group="Master data", menu_item="Hierarchy")
+                    self.page.wait_for_timeout(1000)
+                    _wait_for_hierarchy_list()
+                    for _ in range(3):
+                        add_clicked = _click_add_new()
+                        if add_clicked:
+                            break
+                        self.page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+            if not add_clicked:
+                results.append({"hierarchy": name, "status": "ERROR", "reason": "Could not click 'Add New' button (after recovery retry)"})
                 continue
 
             self.page.wait_for_timeout(1200)
@@ -2033,6 +2108,22 @@ class BrowserTools:
             # Open the editor for this hierarchy (pencil click)
             opened = _open_hierarchy_editor(list_frame, hierarchy_name)
             if not opened:
+                # Retry with refreshed list frame (in case frame reloaded)
+                self.page.wait_for_timeout(500)
+                list_frame = _wait_for_attributes_list() or list_frame
+                opened = _open_hierarchy_editor(list_frame, hierarchy_name)
+
+            if not opened:
+                # Recovery: navigate back to Attributes and retry once.
+                try:
+                    self._tool_open_left_menu_item(menu_group="Master data", menu_item="Attributes")
+                    self.page.wait_for_timeout(1_000)
+                    list_frame = _wait_for_attributes_list() or list_frame
+                    opened = _open_hierarchy_editor(list_frame, hierarchy_name)
+                except Exception:
+                    pass
+
+            if not opened:
                 results.append({
                     "hierarchy": hierarchy_name,
                     "status": "ERROR",
@@ -2052,6 +2143,19 @@ class BrowserTools:
                 )
             except Exception:
                 pass
+            if not editor_ready:
+                # One retry: re-open the editor for the same hierarchy.
+                self.page.wait_for_timeout(700)
+                list_frame = _wait_for_attributes_list() or list_frame
+                if _open_hierarchy_editor(list_frame, hierarchy_name):
+                    self.page.wait_for_timeout(1_000)
+                    try:
+                        editor_ready = editor_frame.evaluate(
+                            """() => !!document.querySelector('input[name$="attributeName"], input[id$="attributeName"]')"""
+                        )
+                    except Exception:
+                        editor_ready = False
+
             if not editor_ready:
                 results.append({
                     "hierarchy": hierarchy_name,
@@ -2102,3 +2206,438 @@ class BrowserTools:
                 f"Skipped rows with missing hierarchy before first hierarchy value: {skipped_missing_hierarchy[:5]}"
             )
         return f"Configured attributes by hierarchy: {results}"
+
+    def _tool_configure_cross_hierarchies(
+        self,
+        cross_hierarchy_rows: list | None = None,
+        frame_url_contains: str = "hierarchy",
+    ) -> str:
+        """Configure Cross Hierarchy from list page by clicking Add New, adding rows, and saving."""
+        if not isinstance(cross_hierarchy_rows, list) or not cross_hierarchy_rows:
+            excel_path = os.environ.get("EXCEL_PATH", "").strip() or "Test Documentxl.xlsx"
+            try:
+                configs = load_cross_hierarchy_configs_from_master_data(excel_path)
+                cross_hierarchy_rows = [
+                    {
+                        "attribute name": cfg.attribute_name,
+                        "hierarchy 1\nproduct": cfg.hierarchy_1_product,
+                        "hierarchy 2 channel": cfg.hierarchy_2_channel,
+                        "hierarchy location": cfg.hierarchy_3_location,
+                        "attribute type": cfg.attribute_type or "",
+                        "mapped column": cfg.mapped_column or "",
+                        "editable": cfg.editable or "",
+                    }
+                    for cfg in configs
+                ]
+            except Exception as e:
+                return f"ERROR: cross_hierarchy_rows missing and auto-load failed: {e}"
+
+            if not isinstance(cross_hierarchy_rows, list) or not cross_hierarchy_rows:
+                return f"ERROR: cross_hierarchy_rows missing and auto-load found no cross hierarchy rows (excel='{excel_path}')."
+
+        def _norm(s: str) -> str:
+            return (s or "").strip().lower().replace(" ", "").replace("_", "")
+
+        def _get_row_val(row: dict, aliases: list) -> str:
+            if not isinstance(row, dict):
+                return ""
+            for k, v in row.items():
+                nk = _norm(str(k))
+                if nk in aliases:
+                    return "" if v is None else str(v).strip()
+            return ""
+
+        def _find_cross_hierarchy_frame():
+            # Prefer frame where Cross Hierarchy content is visible.
+            for f in self.page.frames:
+                try:
+                    has_cross = f.evaluate(
+                        """() => {
+                            const txt = (document.body?.innerText || '').toLowerCase();
+                            return txt.includes('cross hierarchy configuration') || txt.includes('add cross hierarchy');
+                        }"""
+                    )
+                    if has_cross:
+                        return f
+                except Exception:
+                    continue
+
+            preferred = [
+                f for f in self.page.frames
+                if frame_url_contains.lower() in (f.url or "").lower()
+            ]
+            for f in (preferred or self.page.frames):
+                try:
+                    has_content = f.evaluate(
+                        """() => {
+                            const body_text = (document.body?.innerText || '').toLowerCase();
+                            return body_text.includes('cross hierarchy') || body_text.includes('add new');
+                        }"""
+                    )
+                    if has_content:
+                        return f
+                except Exception:
+                    continue
+            return preferred[0] if preferred else None
+
+        def _wait_for_list_frame(max_tries: int = 20, delay_ms: int = 400):
+            last = None
+            for _ in range(max_tries):
+                frame = _find_cross_hierarchy_frame()
+                if frame is not None:
+                    last = frame
+                    try:
+                        ready = frame.evaluate(
+                            """() => {
+                                const txt = (document.body?.innerText || '').toLowerCase();
+                                const hasTitle = txt.includes('cross hierarchy configuration');
+                                const hasAdd = txt.includes('add new');
+                                return hasTitle && hasAdd;
+                            }"""
+                        )
+                        if ready:
+                            return frame
+                    except Exception:
+                        pass
+                self.page.wait_for_timeout(delay_ms)
+            return last
+
+        def _click_add_new(list_frame) -> bool:
+            try:
+                return bool(list_frame.evaluate(
+                    r"""() => {
+                        const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        const candidates = Array.from(document.querySelectorAll('a, button, input[type="button"], input[type="submit"], img'));
+                        let add = candidates.find(el => {
+                            const t = (el.innerText || el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                            return t === 'add new' || t.includes('add new');
+                        });
+                        if (!add) {
+                            add = candidates.find(el => {
+                                const id = (el.id || '').toLowerCase();
+                                const name = (el.name || '').toLowerCase();
+                                const title = (el.title || '').toLowerCase();
+                                const alt = (el.alt || '').toLowerCase();
+                                const src = (el.src || '').toLowerCase();
+                                const onclick = (el.getAttribute('onclick') || '').toLowerCase();
+                                return id.includes('addnew') || id.includes('add_new') ||
+                                       name.includes('addnew') || name.includes('add_new') ||
+                                       title.includes('add') || alt.includes('add') || src.includes('add') ||
+                                       onclick.includes('add');
+                            });
+                        }
+                        if (!add) return false;
+                        const clickable = add.closest('a,button') || add;
+                        clickable.click();
+                        return true;
+                    }"""
+                ))
+            except Exception:
+                return False
+
+        def _is_editor_open(editor_frame) -> bool:
+            try:
+                return bool(editor_frame.evaluate(
+                    """() => {
+                        const txt = (document.body?.innerText || '').toLowerCase();
+                        const hasEditor = txt.includes('add cross hierarchy');
+                        const hasAttrInput = !!document.querySelector('input[name*="attribute" i], input[id*="attribute" i], input[type="text"]');
+                        const hasAddBtn = !!Array.from(document.querySelectorAll('input[type="submit"], button, a')).find(el => {
+                            const t = (el.innerText || el.textContent || el.value || '').toLowerCase().trim();
+                            return t === 'add';
+                        });
+                        return hasEditor && hasAttrInput && hasAddBtn;
+                    }"""
+                ))
+            except Exception:
+                return False
+
+        def _wait_for_editor(editor_frame, max_tries: int = 20, delay_ms: int = 400) -> bool:
+            for _ in range(max_tries):
+                if _is_editor_open(editor_frame):
+                    return True
+                self.page.wait_for_timeout(delay_ms)
+            return False
+
+        def _wait_for_editor_any(max_tries: int = 20, delay_ms: int = 400):
+            last = None
+            for _ in range(max_tries):
+                frame = _find_cross_hierarchy_frame()
+                if frame is not None:
+                    last = frame
+                    if _is_editor_open(frame):
+                        return frame
+                self.page.wait_for_timeout(delay_ms)
+            return None
+
+        def _set_top_selects(editor_frame, product: str, location: str, channel: str) -> tuple[bool, str]:
+            # Based on observed UI, first 3 selects in editor are PRODUCT, LOCATION, CHANNEL.
+            try:
+                ok = editor_frame.evaluate(
+                    r"""([product, location, channel]) => {
+                        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const setOne = (sel, wanted) => {
+                            if (!sel || !wanted) return true;
+                            const wn = norm(wanted);
+                            const opts = Array.from(sel.options || []);
+                            const exact = opts.find(o => norm(o.textContent || o.label || '') === wn);
+                            const contains = opts.find(o => norm(o.textContent || o.label || '').includes(wn));
+                            const target = exact || contains;
+                            if (!target) return false;
+                            sel.value = target.value;
+                            sel.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        };
+
+                        const selects = Array.from(document.querySelectorAll('select'));
+                        if (selects.length < 3) return false;
+                        const p = setOne(selects[0], product);
+                        const l = setOne(selects[1], location);
+                        const c = setOne(selects[2], channel);
+                        return p && l && c;
+                    }""",
+                    [product, location, channel],
+                )
+                return (bool(ok), "ok" if ok else "Could not set PRODUCT/LOCATION/CHANNEL")
+            except Exception as e:
+                return False, f"Header select error: {e}"
+
+        def _fill_attribute_row(editor_frame, attr_name: str, data_type: str, mapped_column: str, editable: str) -> tuple[bool, str]:
+            try:
+                ok = editor_frame.evaluate(
+                    r"""([val]) => {
+                        const input = document.querySelector('input[name*="attributeName" i], input[id*="attributeName" i], input[type="text"]');
+                        if (!input) return false;
+                        input.focus();
+                        input.value = val;
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                        input.blur();
+                        return true;
+                    }""",
+                    [attr_name],
+                )
+                if not ok:
+                    return False, "Attribute Name input not found"
+            except Exception as e:
+                return False, f"Attribute Name error: {e}"
+
+            if data_type:
+                try:
+                    dt_ok = editor_frame.evaluate(
+                        r"""([val]) => {
+                            const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                            const wn = norm(val);
+                            const all = Array.from(document.querySelectorAll('select'));
+                            const selects = all.length > 3 ? all.slice(3) : all;
+                            for (const sel of selects) {
+                                const opts = Array.from(sel.options || []);
+                                const exact = opts.find(o => norm(o.textContent || o.label || '') === wn);
+                                const contains = opts.find(o => norm(o.textContent || o.label || '').includes(wn));
+                                const target = exact || contains;
+                                if (!target) continue;
+                                sel.value = target.value;
+                                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                return true;
+                            }
+                            return false;
+                        }""",
+                        [data_type],
+                    )
+                    if not dt_ok:
+                        return False, f"DataType '{data_type}' not found in Cross Hierarchy form"
+                except Exception:
+                    pass
+
+            try:
+                mapped_ok = editor_frame.evaluate(
+                    r"""([mapped]) => {
+                        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const all = Array.from(document.querySelectorAll('select'));
+                        const selects = all.length > 3 ? all.slice(3) : all;
+                        if (!selects.length) return false;
+                        // Prefer the select that has a "Select"-style placeholder option.
+                        const sel = selects.find(s => Array.from(s.options || []).some(o => norm(o.textContent || o.label || '') === 'select'))
+                                 || selects[selects.length - 1];
+                        const opts = Array.from(sel.options || []);
+                        let target = null;
+                        const mappedNorm = norm(mapped);
+                        const hasConcreteMapped = !!mapped && mappedNorm && mappedNorm !== 'select';
+
+                        if (hasConcreteMapped) {
+                            const wn = mappedNorm;
+                            target = opts.find(o => norm(o.textContent || o.label || '') === wn)
+                                  || opts.find(o => norm(o.textContent || o.label || '').includes(wn));
+                        }
+
+                        // If mapped value is blank/Select, keep current UI default as-is.
+                        if (!hasConcreteMapped) return true;
+
+                        if (!target) return false;
+                        sel.value = target.value;
+                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                        return true;
+                    }""",
+                    [mapped_column],
+                )
+                if mapped_column and mapped_column.strip().lower() != "select" and not mapped_ok:
+                    return False, f"Mapped Column '{mapped_column}' not found in Cross Hierarchy form"
+            except Exception:
+                pass
+
+            should_check = _norm(editable) in ("yes", "true", "1")
+            try:
+                cb = editor_frame.locator('input[type="checkbox"]')
+                if cb.count() > 0:
+                    set_checkbox_state(cb.first, should_check)
+            except Exception:
+                pass
+
+            try:
+                clicked = editor_frame.evaluate(
+                    r"""() => {
+                        const candidates = Array.from(document.querySelectorAll('input[type="submit"], button, a'));
+                        const add = candidates.find(el => {
+                            const t = (el.innerText || el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                            return t === 'add';
+                        });
+                        if (!add) return false;
+                        (add.closest('button,a') || add).click();
+                        return true;
+                    }"""
+                )
+                if not clicked:
+                    return False, "Add button not found"
+            except Exception as e:
+                return False, f"Add click error: {e}"
+
+            self.page.wait_for_timeout(900)
+            return True, "ok"
+
+        def _click_save(editor_frame) -> tuple[bool, str]:
+            try:
+                clicked = editor_frame.evaluate(
+                    r"""() => {
+                        const candidates = Array.from(document.querySelectorAll('input[type="submit"], button, a'));
+                        const save = candidates.find(el => {
+                            const t = (el.innerText || el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                            return t === 'save';
+                        });
+                        if (!save) return false;
+                        (save.closest('button,a') || save).click();
+                        return true;
+                    }"""
+                )
+                if not clicked:
+                    return False, "Save button not found"
+                self.page.wait_for_timeout(1200)
+                return True, "ok"
+            except Exception as e:
+                return False, f"Save error: {e}"
+
+        grouped = {}
+        for row in cross_hierarchy_rows:
+            if not isinstance(row, dict):
+                continue
+            h1 = _get_row_val(row, ["hierarchy1", "hierarchy1product", "hierarchy_1_product", "product", "hierarchy 1"])
+            h2 = _get_row_val(row, ["hierarchy2", "hierarchy2channel", "hierarchy_2_channel", "channel", "hierarchy 2"])
+            h3 = _get_row_val(row, ["hierarchy3", "hierarchy3location", "hierarchylocation", "hierarchy_3_location", "location", "hierarchy 3"])
+            grouped.setdefault((h1, h3, h2), []).append(row)
+
+        if not grouped:
+            return "ERROR: No valid cross_hierarchy_rows provided."
+
+        results = []
+        for (product, location, channel), rows in grouped.items():
+            list_frame = _wait_for_list_frame()
+            if list_frame is None:
+                results.append({
+                    "group": {"product": product, "location": location, "channel": channel},
+                    "status": "ERROR",
+                    "reason": "Could not find Cross Hierarchy list frame",
+                })
+                continue
+
+            # If editor is already open (state drift), continue without clicking Add New.
+            editor_frame = _wait_for_editor_any(max_tries=2, delay_ms=250)
+
+            if editor_frame is None:
+                add_ok = False
+                for _ in range(6):
+                    list_frame = _find_cross_hierarchy_frame() or list_frame
+                    add_ok = _click_add_new(list_frame)
+                    if add_ok:
+                        break
+                    self.page.wait_for_timeout(500)
+
+                if add_ok:
+                    self.page.wait_for_timeout(900)
+                    editor_frame = _wait_for_editor_any(max_tries=20, delay_ms=400)
+
+            if editor_frame is None:
+                # Recovery: reopen Cross Hierarchy menu and retry Add New/editor once.
+                try:
+                    self._tool_open_left_menu_item(menu_group="Master data", menu_item="Cross Hierarchy")
+                    self.page.wait_for_timeout(1_000)
+                    list_frame = _wait_for_list_frame(max_tries=12, delay_ms=350)
+                    if list_frame is not None:
+                        add_ok = False
+                        for _ in range(4):
+                            add_ok = _click_add_new(list_frame)
+                            if add_ok:
+                                break
+                            self.page.wait_for_timeout(500)
+                        if add_ok:
+                            self.page.wait_for_timeout(900)
+                            editor_frame = _wait_for_editor_any(max_tries=16, delay_ms=350)
+                except Exception:
+                    pass
+
+            if editor_frame is None:
+                results.append({
+                    "group": {"product": product, "location": location, "channel": channel},
+                    "status": "ERROR",
+                    "reason": "Could not click Add New or open Add Cross Hierarchy editor",
+                })
+                continue
+
+            ok_header, header_msg = _set_top_selects(editor_frame, product, location, channel)
+            if not ok_header:
+                results.append({
+                    "group": {"product": product, "location": location, "channel": channel},
+                    "status": "ERROR",
+                    "reason": header_msg,
+                })
+                continue
+
+            added = 0
+            row_errors = []
+            for row in rows:
+                attr_name = _get_row_val(row, ["attributename", "attribute_name", "attribute name", "name"])
+                if not attr_name:
+                    row_errors.append("missing attribute_name")
+                    continue
+                data_type = _get_row_val(row, ["datatype", "data_type", "attribute_type", "attributetype", "type"])
+                mapped_column = _get_row_val(row, ["mappedcolumn", "mapped_column", "mapped column", "mapto", "map_to"])
+                editable = _get_row_val(row, ["editable", "iseditable", "is_editable"])
+
+                ok_row, row_msg = _fill_attribute_row(editor_frame, attr_name, data_type, mapped_column, editable)
+                if ok_row:
+                    added += 1
+                else:
+                    row_errors.append(f"{attr_name}: {row_msg}")
+
+            ok_save, save_msg = _click_save(editor_frame)
+            if not ok_save:
+                row_errors.append(save_msg)
+
+            status = "OK" if not row_errors else ("PARTIAL" if added > 0 else "ERROR")
+            results.append({
+                "group": {"product": product, "location": location, "channel": channel},
+                "status": status,
+                "added": added,
+                "total": len(rows),
+                "errors": row_errors[:8],
+            })
+
+        return f"Configured cross hierarchies: {results}"

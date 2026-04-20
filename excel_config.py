@@ -32,6 +32,17 @@ class HierarchyColumnConfig:
     levels: list[HierarchyLevelConfig]
 
 
+@dataclass
+class CrossHierarchyConfig:
+    attribute_name: str
+    hierarchy_1_product: str
+    hierarchy_2_channel: str
+    hierarchy_3_location: str
+    attribute_type: str | None = None
+    mapped_column: str | None = None
+    editable: str | None = None
+
+
 def load_menu_target_from_sheet(file_path: str, sheet_name: str) -> str:
     """Return the first non-empty cell text from the given sheet (used as menu_item)."""
     path = Path(file_path)
@@ -256,6 +267,134 @@ def load_hierarchy_configs_from_master_data(file_path: str, sheet_name: str = "M
                 hierarchy_name=hierarchy_name,
                 levels=levels,
             ))
+
+    return configs
+
+
+def load_cross_hierarchy_configs_from_master_data(file_path: str, sheet_name: str = "Master data") -> list[CrossHierarchyConfig]:
+    """
+    Parse cross hierarchy config from the Master data sheet.
+
+    Structure:
+      - A row with "Cross Hierarchy" in col1 (col2/col3 empty) = section start marker
+      - Header row: Attribute Name | Hierarchy 1\nProduct | Hierarchy 2 Channel | Hierarchy Location | Editable | Cross Hierarchy
+      - Data rows: each row has attribute name and hierarchy mappings
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        raise ValueError(f"Only Excel files are supported (.xlsx/.xlsm). Got: {path.name}")
+
+    wb = load_workbook(path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+
+    if ws.max_row < 49:
+        return []
+
+    # Find "Cross Hierarchy" marker row
+    cross_h_marker_row: int | None = None
+    for r in range(1, ws.max_row + 1):
+        c1 = ws.cell(row=r, column=1).value
+        text = "" if c1 is None else str(c1).strip()
+        if text.lower() == "cross hierarchy":
+            cross_h_marker_row = r
+            break
+
+    if cross_h_marker_row is None:
+        return []
+
+    def _nh(v: Any) -> str:
+        return str(v or "").strip().lower().replace(" ", "").replace("_", "").replace("\n", "")
+
+    def _detect_header_indices(row_values: list[str]) -> tuple[int, int, int, int, int | None, int | None, int | None] | None:
+        attr_name_col = None
+        h1_col = None
+        h2_col = None
+        h3_col = None
+        attr_type_col = None
+        mapped_col = None
+        editable_col = None
+
+        for idx, raw in enumerate(row_values):
+            h = _nh(raw)
+            if "attribute" in h and "name" in h:
+                attr_name_col = idx
+            elif "product" in h and "hierarchy" in h:
+                h1_col = idx
+            elif "channel" in h and "hierarchy" in h:
+                h2_col = idx
+            elif "location" in h and "hierarchy" in h:
+                h3_col = idx
+            elif "attribute" in h and "type" in h:
+                attr_type_col = idx
+            elif "mapped" in h and "column" in h:
+                mapped_col = idx
+            elif "map" in h and "to" in h:
+                mapped_col = idx
+            elif "editable" in h:
+                editable_col = idx
+
+        if attr_name_col is None or h1_col is None or h2_col is None or h3_col is None:
+            return None
+        return (attr_name_col, h1_col, h2_col, h3_col, attr_type_col, mapped_col, editable_col)
+
+    def _cell_str(row_idx: int, col_idx: int | None) -> str:
+        if col_idx is None:
+            return ""
+        v = ws.cell(row=row_idx, column=col_idx + 1).value
+        return "" if v is None else str(v).strip()
+
+    current_cols: tuple[int, int, int, int, int | None, int | None, int | None] | None = None
+    configs: list[CrossHierarchyConfig] = []
+
+    # Parse all data blocks under "Cross Hierarchy" (set1, set2, ...), even when separated by blank rows.
+    for r in range(cross_h_marker_row + 1, ws.max_row + 1):
+        row_values = [str(ws.cell(row=r, column=c).value or "").strip() for c in range(1, ws.max_column + 1)]
+
+        detected = _detect_header_indices(row_values)
+        if detected is not None:
+            current_cols = detected
+            continue
+
+        if current_cols is None:
+            continue
+
+        attr_name_col, h1_col, h2_col, h3_col, attr_type_col, mapped_col, editable_col = current_cols
+        attr_name = _cell_str(r, attr_name_col)
+        if not attr_name:
+            continue
+
+        attr_norm = _nh(attr_name)
+        # Ignore block labels and any accidental repeated header text in data rows.
+        if attr_norm.startswith("set"):
+            continue
+        if "attribute" in attr_norm and "name" in attr_norm:
+            continue
+
+        h1 = _cell_str(r, h1_col)
+        h2 = _cell_str(r, h2_col)
+        h3 = _cell_str(r, h3_col)
+        if not (h1 or h2 or h3):
+            continue
+
+        attribute_type = _cell_str(r, attr_type_col)
+        mapped_column = _cell_str(r, mapped_col)
+        editable = _cell_str(r, editable_col)
+
+        configs.append(CrossHierarchyConfig(
+            attribute_name=attr_name,
+            hierarchy_1_product=h1,
+            hierarchy_2_channel=h2,
+            hierarchy_3_location=h3,
+            attribute_type=attribute_type,
+            mapped_column=mapped_column,
+            editable=editable,
+        ))
 
     return configs
 

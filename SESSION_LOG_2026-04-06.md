@@ -200,3 +200,56 @@ This file captures what was completed today so work can continue even if the cha
   - Generate new token and update .env with fresh value
 - **Prevention**: Never commit .env files with real tokens to version control
 
+## Session Summary - 2026-04-15
+
+### User-Reported Problems Addressed
+- Add button in Attributes form was not reliably committing rows.
+- Customer selection intermittently stalled/fail after login.
+- Hierarchy tool occasionally clicked Add New in wrong frame.
+- Attributes step sometimes skipped/failing to open hierarchy edit rows.
+
+### Code Changes Completed
+1. `browser_tools.py`
+- `_tool_select_option_in_frame` hardened with:
+  - frame retry resolution
+  - dropdown readiness wait
+  - robust label normalization/matching
+  - selected-option verification before success
+- `_tool_configure_all_hierarchies` hardened with:
+  - retry on form-not-found after Add New
+  - stricter hierarchy-frame targeting (avoid ShowConfigurations misclick)
+- `_tool_configure_attributes_by_hierarchy` hardened with:
+  - optional `attributes_rows` auto-load fallback from Excel when omitted
+  - wait for Attributes list readiness before row operations
+  - broader edit/pencil click selectors and row action fallback logic
+- ICEfaces stability improvements for attributes row entry:
+  - JS event-dispatched fill for Attribute Name
+  - JS MouseEvent-based Add submit flow with post-click wait
+
+2. `main.py`
+- Prompt instructions updated to explicitly retry customer selection path before failing.
+
+### Validation Runs (Key)
+- Successful full runs:
+  - `run_confident_test.txt`
+  - `run_confident_test2_retry.txt`
+  - `run_keep_open_retry2.txt` (KEEP_OPEN=true flow)
+- Confirmed successful counts in latest stable run:
+  - Product attributes: 12/12
+  - Channel attributes: 8/8
+  - Location attributes: 6/6
+  - Hierarchies configured: Location, Channel
+
+### Git Status for This Session
+- Changes committed and pushed to GitHub `main`.
+- Final pushed commit: `094fbf1`.
+- Push initially blocked by GitHub push protection due to PAT text in this log; resolved by redaction and amended push.
+
+### Next-Session Quick Resume
+1. Use `KEEP_OPEN=true` when visual verification is required.
+2. For full Attributes flow run:
+   - `EXCEL_TARGET_SHEET=Attributes`
+   - run `main.py` from project venv
+3. Primary verification log for current stable behavior:
+   - `run_keep_open_retry2.txt`
+

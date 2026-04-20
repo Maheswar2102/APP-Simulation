@@ -6,6 +6,9 @@ Usage:
 """
 import os
 import json
+import re
+from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
 from agent import WebAgent
 from excel_config import (
@@ -14,6 +17,7 @@ from excel_config import (
     load_named_table_rows_from_sheet,
     load_runtime_config_from_excel,
     load_sheet_rows_as_dicts,
+    load_cross_hierarchy_configs_from_master_data,
 )
 
 # Keep shell-provided overrides (e.g., KEEP_OPEN=false for CI/non-interactive runs).
@@ -77,6 +81,9 @@ elif runtime.menu_group and runtime.menu_group.lower() == "master data" and attr
     # When Attributes are embedded in Master data, still load hierarchy blocks first.
     master_data_hierarchy_configs = load_hierarchy_configs_from_master_data(EXCEL_PATH, EXCEL_MENU_SHEET or "Master data")
 
+# Load cross hierarchy configs
+cross_hierarchy_configs = load_cross_hierarchy_configs_from_master_data(EXCEL_PATH, EXCEL_MENU_SHEET or "Master data")
+
 has_customer_config = bool(runtime.customer_name and runtime.configuration_number)
 has_menu_target = bool(runtime.menu_group and runtime.menu_item)
 is_master_data_sequential = bool(
@@ -134,7 +141,70 @@ After that (menu navigation flow):
 10. Confirm the final screen opened for "{runtime.menu_item}".
 """
 
-if runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and target_sheet_key in {"hierarchy", "hierarchies"}:
+# Master data sequential workflow (hierarchies + attributes + cross hierarchies) takes priority
+if runtime.menu_group and runtime.menu_group.lower() == "master data" and master_data_hierarchy_configs and attributes_rows:
+    TASK += f"""
+
+=== MASTER DATA SEQUENTIAL AUTOMATION ===
+Detected both hierarchy blocks and attributes rows in Excel.
+Run in this EXACT order:
+
+11. Open left menu using open_left_menu_item with:
+   - menu_group="{runtime.menu_group}"
+   - menu_item="Hierarchy"
+12. Immediately after opening "Hierarchy", call configure_all_hierarchies with exactly this parameter.
+    CRITICAL:
+    - Execute exactly one step at a time; do not pre-open any later menu item.
+    - Never call open_left_menu_item for two different menu_item values in the same iteration.
+    - Do not call open_left_menu_item for "Attributes" before configure_all_hierarchies returns.
+    - Do not call open_left_menu_item for "Cross Hierarchy" before configure_attributes_by_hierarchy returns.
+    - Do not navigate away from the Hierarchy page while hierarchy configuration is running.
+    - Wait for configure_all_hierarchies to finish and inspect its result first.
+    - If any hierarchy has status ERROR, stop and report that error instead of continuing to Attributes.
+    Do NOT call click_element_with_text separately:
+    hierarchies = {json.dumps([{
+    "hierarchy_name": cfg.hierarchy_name,
+    "levels": [{"name": lvl.name, "visible": lvl.visible, "non_hierarchial": lvl.non_hierarchial} for lvl in cfg.levels]
+} for cfg in master_data_hierarchy_configs])}
+    The tool handles 'Add New' + form fill + save for each hierarchy automatically.
+13. Only after configure_all_hierarchies succeeds for all hierarchies, open left menu using open_left_menu_item with:
+   - menu_group="{runtime.menu_group}"
+   - menu_item="Attributes"
+14. Call configure_attributes_by_hierarchy with exactly this parameter:
+    attributes_rows = {json.dumps(attributes_rows)}
+    frame_url_contains = "attribute"
+    The tool handles opening each hierarchy editor, filling all attribute fields, and saving.
+    CRITICAL:
+    - Wait for configure_attributes_by_hierarchy result before any further menu navigation.
+    - Forbidden sequence: open_left_menu_item("Cross Hierarchy") before configure_attributes_by_hierarchy result.
+"""
+    
+    if cross_hierarchy_configs:
+        cross_h_rows = [{
+            "attribute_name": cfg.attribute_name,
+            "hierarchy_1_product": cfg.hierarchy_1_product,
+            "hierarchy_2_channel": cfg.hierarchy_2_channel,
+            "hierarchy_3_location": cfg.hierarchy_3_location,
+            "attribute_type": cfg.attribute_type or "",
+            "mapped_column": cfg.mapped_column or "",
+            "editable": cfg.editable or ""
+        } for cfg in cross_hierarchy_configs]
+        TASK += f"""
+15. Only after configure_attributes_by_hierarchy succeeds, open left menu using open_left_menu_item with:
+   - menu_group="{runtime.menu_group}"
+   - menu_item="Cross Hierarchy"
+16. Call configure_cross_hierarchies with exactly this parameter:
+    cross_hierarchy_rows = {json.dumps(cross_h_rows)}
+    frame_url_contains = "hierarchy"
+    The tool will fill each cross hierarchy attribute mapping with the specified hierarchy levels.
+17. Report results and done.
+"""
+    else:
+        TASK += """
+15. Report results and done.
+"""
+# Fallback: old hierarchy-only workflow (no attributes)
+elif runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and target_sheet_key in {"hierarchy", "hierarchies"}:
     if master_data_hierarchy_configs:
         TASK += f"""
 
@@ -201,31 +271,6 @@ Hierarchy configuration flow:
 11. No hierarchy rows found in '{EXCEL_MENU_SHEET or "Master data"}' and none in '{target_sheet_name}'.
     Report this clearly and stop without making hierarchy changes.
 """
-elif runtime.menu_group and runtime.menu_group.lower() == "master data" and master_data_hierarchy_configs and attributes_rows:
-    TASK += f"""
-
-=== MASTER DATA SEQUENTIAL AUTOMATION ===
-Detected both hierarchy blocks and attributes rows in Excel.
-Run in this EXACT order:
-
-11. Open left menu using open_left_menu_item with:
-   - menu_group="{runtime.menu_group}"
-   - menu_item="Hierarchy"
-12. Call configure_all_hierarchies with exactly this parameter (do NOT call click_element_with_text separately):
-    hierarchies = {json.dumps([{
-    "hierarchy_name": cfg.hierarchy_name,
-    "levels": [{"name": lvl.name, "visible": lvl.visible, "non_hierarchial": lvl.non_hierarchial} for lvl in cfg.levels]
-} for cfg in master_data_hierarchy_configs])}
-    The tool handles 'Add New' + form fill + save for each hierarchy automatically.
-13. After configure_all_hierarchies succeeds, open left menu using open_left_menu_item with:
-   - menu_group="{runtime.menu_group}"
-   - menu_item="Attributes"
-14. Call configure_attributes_by_hierarchy with exactly this parameter:
-    attributes_rows = {json.dumps(attributes_rows)}
-    frame_url_contains = "attribute"
-    The tool handles opening each hierarchy editor, filling all attribute fields, and saving.
-15. Report results and done.
-"""
 elif runtime.menu_group and runtime.menu_item and runtime.menu_group.lower() == "master data" and target_sheet_key in {"attribute", "attributes"}:
     if attributes_rows or target_rows:
         rows_for_attributes = attributes_rows or target_rows
@@ -252,6 +297,117 @@ Report everything completed: login status, customer selected, configuration open
 parent menu clicked, child menu clicked, and final URL/title/frame state.
 """
 
+
+def _has_section_failure(text_lower: str, section_terms: list[str]) -> bool:
+    terms = "|".join(section_terms)
+    return bool(re.search(rf"(?:{terms}).{{0,120}}\b(error|failed|could not|unable)\b", text_lower, flags=re.DOTALL))
+
+
+def _has_section_success(text_lower: str, success_patterns: list[str]) -> bool:
+    return any(p in text_lower for p in success_patterns)
+
+
+def _status_for_section(text_lower: str, section_terms: list[str], success_patterns: list[str]) -> str:
+    if _has_section_failure(text_lower, section_terms):
+        return "FAIL"
+    if _has_section_success(text_lower, success_patterns):
+        return "PASS"
+    return "UNKNOWN"
+
+
+def _write_run_summary(summary_text: str) -> None:
+    text_lower = (summary_text or "").lower()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    overall_success = (
+        "completed successfully" in text_lower
+        or "no errors encountered" in text_lower
+        or "without any errors" in text_lower
+    )
+
+    hierarchy_status = _status_for_section(
+        text_lower,
+        ["hierarch", "configure_all_hierarchies"],
+        [
+            "hierarchies configured successfully",
+            "hierarchy configuration",
+            "configure_all_hierarchies results: [{'hierarchy'",
+            "status': 'ok'",
+        ],
+    )
+    attributes_status = _status_for_section(
+        text_lower,
+        ["attribute", "configure_attributes_by_hierarchy"],
+        [
+            "configured attributes by hierarchy",
+            "attributes configured",
+            "attribute configuration",
+            "all attributes",
+        ],
+    )
+    cross_hierarchy_status = _status_for_section(
+        text_lower,
+        ["cross hierarch", "configure_cross_hierarchies"],
+        [
+            "configured cross hierarchies",
+            "cross hierarchy configuration",
+            "cross hierarchy mapping completed",
+            "cross hierarchies configured successfully",
+        ],
+    )
+
+    if overall_success:
+        if hierarchy_status == "UNKNOWN":
+            hierarchy_status = "PASS"
+        if attributes_status == "UNKNOWN":
+            attributes_status = "PASS"
+        if cross_hierarchy_status == "UNKNOWN":
+            cross_hierarchy_status = "PASS"
+
+    expected_hierarchies = len(master_data_hierarchy_configs)
+    expected_attributes = len(attributes_rows) if isinstance(attributes_rows, list) else 0
+    expected_cross_rows = len(cross_hierarchy_configs)
+
+    cross_group_counts: dict[tuple[str, str, str], int] = {}
+    for cfg in cross_hierarchy_configs:
+        key = (cfg.hierarchy_1_product, cfg.hierarchy_2_channel, cfg.hierarchy_3_location)
+        cross_group_counts[key] = cross_group_counts.get(key, 0) + 1
+
+    summary_md = Path("run_summary.md")
+    summary_jsonl = Path("run_summary.jsonl")
+
+    with summary_md.open("a", encoding="utf-8") as f:
+        f.write(f"\n## Run Summary {timestamp}\n")
+        f.write(f"- Hierarchy: {hierarchy_status} (expected rows: {expected_hierarchies})\n")
+        f.write(f"- Attributes: {attributes_status} (expected rows: {expected_attributes})\n")
+        f.write(f"- Cross Hierarchy: {cross_hierarchy_status} (expected rows: {expected_cross_rows})\n")
+        if cross_group_counts:
+            groups_rendered = ", ".join(
+                [f"{p}/{c}/{l}={n}" for (p, c, l), n in cross_group_counts.items()]
+            )
+            f.write(f"- Cross Hierarchy groups: {groups_rendered}\n")
+        f.write("\n")
+
+    record = {
+        "timestamp": timestamp,
+        "hierarchy_status": hierarchy_status,
+        "attributes_status": attributes_status,
+        "cross_hierarchy_status": cross_hierarchy_status,
+        "expected_hierarchies": expected_hierarchies,
+        "expected_attributes": expected_attributes,
+        "expected_cross_rows": expected_cross_rows,
+        "cross_groups": [
+            {
+                "product": p,
+                "channel": c,
+                "location": l,
+                "rows": n,
+            }
+            for (p, c, l), n in cross_group_counts.items()
+        ],
+    }
+    with summary_jsonl.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
 if __name__ == "__main__":
     agent = WebAgent(
         github_token=GITHUB_TOKEN,
@@ -262,3 +418,6 @@ if __name__ == "__main__":
     summary = agent.run(TASK)
     print("\n=== Agent Summary ===")
     print(summary)
+    _write_run_summary(summary)
+    print("\n=== Run Summary Written ===")
+    print("Saved: run_summary.md and run_summary.jsonl")
